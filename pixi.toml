@@ -1,0 +1,18 @@
+[workspace]
+channels = ["conda-forge"]
+name = "pr"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks.run]
+cmd = "node index.js"
+
+[tasks.install]
+cmd = "npm install"
+
+[dependencies]
+nodejs = ">=26.6.0,<26.7"
+make = ">=4.4.1,<5"
+gcc = ">=16.2.0,<16.3"
+python = ">=3.14.7,<3.15"
+gxx = ">=16.2.0,<16.3"

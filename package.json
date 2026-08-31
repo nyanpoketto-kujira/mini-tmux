@@ -1,0 +1,17 @@
+{
+  "name": "discord-terminal-multiplexer",
+  "version": "1.0.0",
+  "description": "Interactive Discord Terminal / Shell Session Manager (mini-tmux) using node-pty and Discord.js v14",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.4.5",
+    "node-pty": "^1.0.0"
+  },
+  "allowScripts": {
+    "node-pty@1.1.0": true
+  }
+}
