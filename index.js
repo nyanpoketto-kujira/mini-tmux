@@ -45,38 +45,38 @@ function println(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
+// Emoji angka untuk react exit code (0️⃣ 1️⃣ 2️⃣ ... 9️⃣)
+const DIGIT_EMOJI = ["0️⃣", "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"];
+
+// Ubah exit code (angka) menjadi rangkaian emoji per-digit.
+// Contoh: 0 -> 0️⃣, 42 -> 4️⃣2️⃣, 137 -> 1️⃣3️⃣7️⃣
+function exitToEmoji(code) {
+  if (code === null || code === undefined) return null;
+  const digits = String(Math.max(0, Math.floor(code))).split("");
+  return digits.map((d) => DIGIT_EMOJI[+d]).join("");
+}
+
 // Aman-kan teks untuk ditampilkan di dalam code block (hindari escape ```)
 function escapeBlock(text) {
   return text.replace(/```/g, "`\u200b``");
 }
 
-// Bersihkan escape ANSI yang merusak tampilan codeblock Discord,
-// TETAPI PERTAHANKAN escape warna grafis SGR (`\x1b[...m`) agar output
-// seperti `ls --color` / colored prompt tampil BERWARNA di Discord.
-//
-// Yang dihapus:
-//  - OSC (window/title bar `\x1b]0;...\x07`, directory tracking, dsb)
-//  - CSI non-SGR: bracketed paste (`\x1b[?2004h` / `\x1b[?2004l`),
-//    kursor movement (`\x1b[?25h`/`l`, `\x1b[H`, `\x1b[1;1H`), clear screen
-//    (`\x1b[2J`), alternate screen `\x1b[?1049h`, dsb.
-//  - karakter kontrol lain (kecuali \t dan \n) termasuk ESC "liar"
-//  - normalisasi \r\n / \r menjadi \n
-//
-// SGR (`\x1b[...m`) dilindungi & dipertahankan secara utuh.
 function cleanAnsi(str) {
-  return str
-    // 1) Hapus OSC (escape sequence window title / shell integration)
-    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
-    // 2) Hapus CSI yang BUKAN SGR (final byte selain `m`), termasuk
-    //    bracketed paste `[?2004h/l` dan kursor `[?25h`, `[H`, `[2J`.
-    .replace(/\x1b\[[\x30-\x3f\x20-\x2f]*[\x40-\x6c\x6e-\x7e]/g, "")
-    // 3) Normalisasi newline dulu supaya \r dan \n tidak tercampur.
-    .replace(/\r\n/g, "\n")
-    .replace(/\r/g, "\n")
-    // 4) Pertahankan semua SGR `\x1b[...m` (warna), buang kontrol lain
-    //    (termasuk ESC yang tidak membentuk sequence valid). Ini meregenerasi
-    //    byte ESC asli sehingga Discord mengenalinya sebagai format ANSI.
-    .replace(/(\x1b\[[0-9;:]*m)|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, (match, sgr) => sgr || "");
+  if (!str) return '';
+  // 1. Normalisasi newline
+  let text = str.replace(/\r\n|\r/g, '\n');
+  // 2. Hapus OSC title sequence (\x1b]...\x07)
+  text = text.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '');
+  // 3. Hapus non-SGR (cursor move, clear screen \x1b[2K, dll)
+  //    Catatan: 'm' (SGR final byte) TIDAK boleh ada di range ini.
+  text = text.replace(/\x1b\[[0-9;?]*[A-HJKSTf-lp-su]/g, '');
+  // 4. Hapus 256-color & truecolor (\x1b[38;...m) yang tidak didukung Discord
+  text = text.replace(/\x1b\[(?:38|48);[0-9;]+m/g, '');
+  // 5. Normalisasi \x1b[m jadi \x1b[0m
+  text = text.replace(/\x1b\[m/g, '\x1b[0m');
+  // 6. Buang kontrol karakter HANYA selain \t, \n, dan \x1b (JANGAN HAPUS \x1b!)
+  text = text.replace(/[\x00-\x08\x0B-\x1A\x1C-\x1F\x7F]/g, '');
+  return text;
 }
 
 function renderBlock(chunk) {
@@ -159,12 +159,16 @@ function spawnSession(channel, name) {
     throw new Error(`Session '${name}' sudah ada.`);
   }
 
+  // Lebar/tinggi terminal. cols=90, rows=30.
+  // TERM=xterm (bukan 256color) agar CLI tools hanya pakai 16 warna ANSI
+  // standar yang didukung Discord. COLORTERM dikosongkan agar aplikasi tidak
+  // mengirim RGB truecolor.
   const ptyProcess = pty.spawn(process.platform === "win32" ? "powershell.exe" : "bash", [], {
-    name: "xterm-256color",
-    cols: 80,
-    rows: 24,
+    name: "xterm",
+    cols: 90,
+    rows: 30,
     cwd: process.env.HOME || process.cwd(),
-    env: { ...process.env, TERM: "xterm-256color" },
+    env: { ...process.env, TERM: "xterm", COLORTERM: "" },
   });
 
   const session = {
@@ -173,6 +177,10 @@ function spawnSession(channel, name) {
     flushTimer: null,
     flushing: false,
     msg: null, // pesan aktif utk batch command saat ini
+    lastExit: null, // exitCode + signal terakhir sesi ini
+    // Pesan Discord pemicu command terakhir. Dipakai sebagai target react
+    // emoji exit code saat pty selesai menjalankan command.
+    lastCmdMsg: null,
     _onData: null,
     _onExit: null,
   };
@@ -184,8 +192,17 @@ function spawnSession(channel, name) {
     scheduleFlush(channel, name);
   };
 
-  session._onExit = (exitCode) => {
-    println(`Session '${name}' exited dengan code ${exitCode}`);
+  session._onExit = (evt) => {
+    // node-pty: evt = { exitCode, signal }
+    const exitCode = evt?.exitCode ?? null;
+    const signal = evt?.signal ?? null;
+    session.lastExit = { exitCode, signal };
+    println(`Session '${name}' exited dengan code ${exitCode}${signal ? ` (signal ${signal})` : ""}`);
+
+    // React emoji angka sesuai digit exit code ke pesan pemicu command &
+    // pesan output terakhir, sebelum sesi ditutup.
+    reactExitCode(session, channel);
+
     closeSession(name, channel);
   };
 
@@ -194,6 +211,33 @@ function spawnSession(channel, name) {
 
   sessions.set(name, session);
   return ptyProcess;
+}
+
+// React emoji angka (0️⃣1️⃣2️⃣...) ke pesan trigger & output sesuai digit exit
+// code. Aman (catch) bila pesan sudah dihapus / tidak tersedia.
+async function reactExitCode(session, channel) {
+  if (!session?.lastExit) return;
+  const emoji = exitToEmoji(session.lastExit.exitCode);
+  if (!emoji) {
+    println(`[exit] Sesi dibunuh sinyal, tanpa exit code -> tidak react.`);
+    return;
+  }
+
+  const targets = new Set();
+  if (session.lastCmdMsg?.id) targets.add(session.lastCmdMsg);
+  if (session.msg?.id && session.msg.id !== session.lastCmdMsg?.id) {
+    targets.add(session.msg);
+  }
+
+  for (const target of targets) {
+    try {
+      if (!target.reactions?.cache?.has(emoji)) {
+        await target.react(emoji);
+      }
+    } catch (err) {
+      println(`[exit] Gagal react '${emoji}' ke pesan: ${err.message}`);
+    }
+  }
 }
 
 function scheduleFlush(channel, name) {
@@ -338,7 +382,12 @@ async function onMessage(message) {
       // Reset pointer agar output berikutnya dibuatkan pesan sendiri,
       // tidak lagi meng-edit pesan command sebelumnya.
       const session = requireActive(channel);
-      if (session) session.msg = null;
+      if (session) {
+        session.msg = null;
+        // Simpan pesan pemicu supaya bisa di-react emoji exit code ketika
+        // command ini selesai dieksekusi pty.
+        session.lastCmdMsg = message;
+      }
 
       const cmd = content.slice(2) + "\r";
       reply = writeToActive(channel, cmd);
