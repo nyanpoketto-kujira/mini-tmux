@@ -1,5 +1,12 @@
 require("dotenv").config();
-const { Client, GatewayIntentBits } = require("discord.js");
+const {
+  Client,
+  GatewayIntentBits,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
+  EmbedBuilder,
+} = require("discord.js");
 
 // Dynamic require for node-pty (native module). Jangan ubah ke ESM import,
 // karena node-pty dibangun sebagai module native (C++ addon).
@@ -33,6 +40,19 @@ const activeSession = new Map();
 // Konstanta batas aman pesan (Discord max = 2000)
 const MAX_CHARS = 1800; // akumulasi output sebelum membuat pesan baru
 const FLUSH_INTERVAL = 800; // ms throttle: edit pesan aktif tiap ~800ms
+
+// ------------------- ADMIN GUARD (opsional) -------------------
+// Awalnya aktif bila ADMIN_MODE=true (atau "1") di .env, lalu bisa di-toggle
+// dari Discord lewat "safe!on" / "safe!off" (hanya admin). Saat aktif, perintah
+// berbahaya (lihat isDangerous) TIDAK langsung dieksekusi; bot men-tag role
+// admin (ADMIN_ROLE_ID) dengan peringatan + tombol ▶ Lanjutkan / ⛔ Hentikan.
+// Hanya member dengan role ADMIN_ROLE_ID yang boleh menekan tombol / toggle.
+let DANGEROUS_ENABLED = process.env.ADMIN_MODE === "true" || process.env.ADMIN_MODE === "1";
+const ADMIN_ROLE_ID = process.env.ADMIN_ROLE_ID || null;
+
+// Termin uji (hardcoded) supaya alur blokir bisa ditest/demo di Discord secara
+// deterministik ("!cat bakwangorengenak"). Cocok persis setelah trim.
+const DANGER_TEST_TERMS = ["cat bakwangorengenak"];
 
 // ------------------- UTIL -------------------
 function getActiveName(channelId) {
@@ -114,10 +134,80 @@ function splitChunk(text, max) {
   return [part, text.slice(part.length)];
 }
 
+// ------------------- DETEKSI PERINTAH BERBAHAYA -------------------
+function isDangerous(cmd) {
+  const norm = cmd.trim();
+  if (DANGER_TEST_TERMS.some((t) => norm === t)) return true;
+
+  const patterns = [
+    // Penghancuran file / filesystem
+    /\brm\s+-[a-z]*r[a-z]*f?[a-z]*\b/i,
+    /\brm\s+-\w*\s+\/(\s|$)/i,
+    /\bmkfs(?:\s|\.)/i,
+    /\bshred\b/i,
+    /\bwipefs\b/i,
+    /\bfdisk\b/i,
+    /\bparted\b/i,
+    /\bdd\b[^\n]*\bof=\s*\/dev\//i,
+    /(?:^|\s)>\s*\/dev\/sd/i,
+    /\bchmod\s+(?:4755|4777|2777|1777|(-R\s+)?\+s)\b/i,
+    /\bchown\s+-R\b/i,
+    // Uptime / power: shutdown, restart, apapun yang mengganggu uptime host
+    /\b(?:shutdown|reboot|poweroff|halt|suspend|hibernate)\b/i,
+    /\bsystemctl\b[^\n]*(?:poweroff|halt|reboot|suspend|hibernate|shutdown|restart)/i,
+    /\b(?:init|telinit)\s+[06sS]\b/i,
+    /\bpm-(?:suspend|hibernate|reboot|poweroff)\b/i,
+    /\/proc\/sysrq-trigger/i,
+    /\bkillall\b/i,
+    /\bkill\s+-\w*\s+-1\b/i, // kill -9 -1 dst. = bunuh semua proses
+    /\bpkill\s+-[69]\b/i,
+    /\bpkill\s+-f\b/i,
+    // Fork bomb
+    /:\(\)\s*\{/i,
+    /:\|:&\s*;?\s*:/i,
+    // Unduh -> eksekusi (pipe ke shell / eksekusi file hasil unduh)
+    /\b(?:curl|wget|lynx|aria2c|nc|ncat)\b[^\n]*\|\s*(?:sh|bash|zsh|pwsh|node|python)\b/i,
+    /\b(?:curl|wget)\b[^\n]*\s-o\s+\S+\s+[^\n]*&&\s*(?:sh|bash|chmod|\.\/)/i,
+    // Reverse shell / akses jarak jauh
+    /\/dev\/tcp\//i,
+    /\b(?:bash|sh|zsh)\s+-i\b/i,
+    /\b(?:nc|ncat|netcat|socat)\b[^\n]*(?:-\s*e\s+|\/bin\/(?:sh|bash)|exec)/i,
+    /\bmkfifo\b[^\n]*;\s*(?:cat|bash)/i,
+    // Baca secret
+    /\.env\b/i,
+    /discord_token/i,
+    /\/proc\/[^/]*\/environ/i,
+    /\.ssh\/(?:id_rsa|id_dsa|id_ecdsa|id_ed25519)\b/i,
+    /\.aws\/credentials/i,
+    /\bprintenv\b/i,
+    // Persistensi
+    /\bcrontab\b/i,
+    /authorized_keys/i,
+    /rc\.local/i,
+    /\/etc\/systemd\//i,
+    /(?:echo|printf|tee)\b[^\n]*>\s*\/etc\//i,
+    /\.bashrc\b/i,
+    /\.profile\b/i,
+    // Privilege / akun
+    /\bsudo\b/i,
+    /\bsu\s+-\s*\w[\s\S]*/i,
+    /\bpkexec\b/i,
+    /\bpasswd\b/i,
+    // Ekfiltrasi (unggah file)
+    /\bcurl\b[^\n]*-\s*F\b/i,
+    /\b(?:scp|rsync)\b/i,
+  ];
+  return patterns.some((re) => re.test(cmd));
+}
+
 // ------------------- STREAMING / FLUSH -------------------
 // Sisa output yang gagal terkirim (rate-limit) / belum muat, menunggu flush
 // berikutnya agar tidak ada data yang "menguap".
 let pendingTail = "";
+
+// Konfirmasi perintah berbahaya yang menunggu keputusan admin (tombol).
+// key = token acak (customId), value = { channelId, sessionName, cmd, triggerMsg }
+const pendingApprovals = new Map();
 
 async function flushSession(channel, name) {
   const session = sessions.get(name);
@@ -441,6 +531,130 @@ function writeToActive(channel, data) {
   }
 }
 
+// ------------------- ADMIN GUARD: KONFIRMASI TOMBOL -------------------
+// Cek apakah member punya role admin (ADMIN_ROLE_ID). Hanya role inilah yang
+// boleh menekan tombol konfirmasi.
+function isAdminMember(member) {
+  if (!member || !ADMIN_ROLE_ID) return false;
+  return member.roles?.cache?.has(ADMIN_ROLE_ID) === true;
+}
+
+// Kirim peringatan tag admin + tombol ▶ Lanjutkan / ⛔ Hentikan. Perintah TIDAK
+// dieksekusi sampai admin menekan tombol. Peringatan SEMUA berlaku untuk siapa
+// pun yang mengetik perintah KECUALI admin sendiri (dieksekusi langsung).
+async function sendDangerWarning(channel, message, cmd, source) {
+  const token = Math.random().toString(36).slice(2, 12);
+  pendingApprovals.set(token, {
+    channelId: channel.id,
+    sessionName: getActiveName(channel.id),
+    cmd,
+    triggerMsg: message,
+  });
+
+  const adminMention = ADMIN_ROLE_ID
+    ? `<@&${ADMIN_ROLE_ID}>`
+    : `<@${message.author.id}>`;
+
+  const embed = new EmbedBuilder()
+    .setColor(0xe74c3c)
+    .setTitle("⚠️ Perintah Berbahaya Diblokir")
+    .setDescription(
+      `Sumber: **${source}**\nPerintah berikut **TIDAK dijalankan** otomatis (admin guard aktif).`
+    )
+    .addFields(
+      { name: "Perintah", value: "```bash\n" + escapeBlock(cmd) + "\n```" },
+      {
+        name: "Aksi",
+        value: "Hanya **admin** yang boleh menekan tombol.\n" +
+          "**▶ Lanjutkan** = izinkan & jalankan SEKALI.\n" +
+          "**⛔ Hentikan** = batalkan.",
+      }
+    )
+    .setFooter({ text: `Oleh: ${message.author.username} · konfirmasi sekali pakai` });
+
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`danger:go:${token}`)
+      .setLabel("▶ Lanjutkan")
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`danger:stop:${token}`)
+      .setLabel("⛔ Hentikan")
+      .setStyle(ButtonStyle.Danger)
+  );
+
+  await channel.send({ content: adminMention, embeds: [embed], components: [row] });
+  return null;
+}
+
+async function onInteraction(interaction) {
+  if (!interaction.isButton()) return;
+  const parts = interaction.customId.split(":");
+  if (parts[0] !== "danger") return;
+  const [, action, token] = parts;
+
+  const pend = pendingApprovals.get(token);
+  if (!pend) {
+    return interaction
+      .reply({ content: "⏳ Konfirmasi sudah kedaluwarsa.", ephemeral: true })
+      .catch(() => {});
+  }
+
+  // Hanya admin (role di env ADMIN_ROLE_ID) yang boleh menekan tombol.
+  if (!isAdminMember(interaction.member)) {
+    return interaction
+      .reply({ content: "🔒 Hanya admin yang bisa menekan tombol ini.", ephemeral: true })
+      .catch(() => {});
+  }
+  pendingApprovals.delete(token);
+
+  if (action === "stop") {
+    const embed = new EmbedBuilder()
+      .setColor(0x95a5a6)
+      .setTitle("⛔ Perintah Ditolak")
+      .setDescription(
+        "```bash\n" + escapeBlock(pend.cmd) + "\n```\nDitolak admin — **tidak dijalankan**."
+      );
+    return interaction
+      .update({ embeds: [embed], components: [] })
+      .catch((err) => println(`[danger] Gagal update pesan: ${err.message}`));
+  }
+
+  // action === "go"
+  let channelObj;
+  try {
+    channelObj =
+      interaction.client.channels.cache.get(pend.channelId) ??
+      (await interaction.client.channels.fetch(pend.channelId));
+  } catch {
+    channelObj = null;
+  }
+  const session = sessions.get(pend.sessionName);
+  if (!session || !channelObj) {
+    const embed = new EmbedBuilder()
+      .setColor(0xe74c3c)
+      .setTitle("⚠️ Session Tidak Aktif")
+      .setDescription("Session sudah ditutup/dihapus — perintah **tidak** dijalankan.");
+    return interaction.update({ embeds: [embed], components: [] }).catch(() => {});
+  }
+
+  // Jalankan sekali, dengan alur stream per-perintah (pesan output baru).
+  session.msg = null;
+  session.currentText = "";
+  if (pend.triggerMsg) session.lastCmdMsg = pend.triggerMsg;
+  const err = writeToActive(channelObj, pend.cmd + "\r");
+
+  const embed = new EmbedBuilder()
+    .setColor(0x2ecc71)
+    .setTitle("▶ Perintah Dijalankan (disetujui admin)")
+    .setDescription(
+      "```bash\n" + escapeBlock(pend.cmd) + "\n```" + (err ? `\n⚠️ ${err}` : "")
+    );
+  await interaction
+    .update({ embeds: [embed], components: [] })
+    .catch((e2) => println(`[danger] Gagal update pesan: ${e2.message}`));
+}
+
 // ------------------- MESSAGE PARSING -------------------
 const ANSI_MAP = {
   "up!": "\x1b[A",
@@ -465,6 +679,7 @@ async function onMessage(message) {
     stripped === "hapus!" ||
     stripped.startsWith("stdin!") ||
     stripped === "c!" ||
+    stripped.startsWith("safe!") ||
     Object.prototype.hasOwnProperty.call(ANSI_MAP, stripped) ||
     stripped.startsWith("!") ||
     stripped.startsWith("help");
@@ -486,11 +701,32 @@ async function onMessage(message) {
       reply = handlePindah(channel, body.slice(7).trim());
     } else if (body === "hapus!") {
       reply = await handleHapus(channel);
+    } else if (body.startsWith("safe!")) {
+      // Admin guard toggle dari Discord: safe!on / safe!off (hanya admin).
+      const arg = body.slice(5).trim().toLowerCase();
+      if (!isAdminMember(message.member)) {
+        reply = "🔒 Hanya admin yang boleh menghidupkan/mematikan admin guard.";
+      } else if (arg === "on" || arg === "ok") {
+        DANGEROUS_ENABLED = true;
+        reply = "🛡️ Admin guard DIHIDUPKAN. Perintah berbahaya akan diblokir (butuh konfirmasi tombol).";
+      } else if (arg === "off") {
+        DANGEROUS_ENABLED = false;
+        reply = "✅ Admin guard DIMATIKAN. Perintah berbahaya berjalan normal.";
+      } else {
+        reply = "❌ Format: `safe!on` atau `safe!off`.";
+      }
     } else if (body.startsWith("stdin!")) {
       // Input interaktif: tetap stream ke pesan aktif terakhir.
       // Hapus satu spasi pemisah bila ada, kirim sisanya verbatim.
       const data = body.slice(6).replace(/^ /, "");
-      reply = writeToActive(channel, data);
+      // Guard juga berlaku untuk input raw yang polanya berbahaya — kecuali
+      // dikirim oleh admin sendiri.
+      const active = requireActive(channel);
+      if (active && DANGEROUS_ENABLED && !isAdminMember(message.member) && isDangerous(data.replace(/\r/g, " "))) {
+        reply = await sendDangerWarning(channel, message, data, "stdin!");
+      } else {
+        reply = writeToActive(channel, data);
+      }
     } else if (body === "c!") {
       reply = writeToActive(channel, "\x03"); // Ctrl+C
     } else if (Object.prototype.hasOwnProperty.call(ANSI_MAP, body)) {
@@ -500,18 +736,24 @@ async function onMessage(message) {
       // PER-COMMAND STREAMING: command baru -> pesan Discord baru.
       // Terima "! cmd" maupun "!cmd", lalu append \r sebagai Enter PTY.
       const session = requireActive(channel);
-      if (session) {
-        // Segmen baru: pesan output perintah ini dibuat sendiri. Output
-        // segmen sebelumnya sudah tampil di `session.msg` (bukan hilang).
-        session.msg = null;
-        session.currentText = "";
-        // Simpan pesan pemicu supaya bisa di-react emoji exit code ketika
-        // command ini selesai dieksekusi pty.
-        session.lastCmdMsg = message;
+      const raw = body.slice(1).trimStart();
+      // Bila admin yang mengirim -> jalan langsung tanpa blokir.
+      const isAuthorAdmin = isAdminMember(message.member);
+      if (session && DANGEROUS_ENABLED && !isAuthorAdmin && isDangerous(raw)) {
+        // Blok dulu: tidak dieksekusi sampai admin setuju via tombol.
+        reply = await sendDangerWarning(channel, message, raw, "perintah");
+      } else {
+        if (session) {
+          // Segmen baru: pesan output perintah ini dibuat sendiri. Output
+          // segmen sebelumnya sudah tampil di `session.msg` (bukan hilang).
+          session.msg = null;
+          session.currentText = "";
+          // Simpan pesan pemicu supaya bisa di-react emoji exit code ketika
+          // command ini selesai dieksekusi pty.
+          session.lastCmdMsg = message;
+        }
+        reply = writeToActive(channel, raw + "\r");
       }
-
-      const cmd = body.slice(1).trimStart() + "\r";
-      reply = writeToActive(channel, cmd);
     }
 
     if (reply) {
@@ -526,12 +768,21 @@ async function onMessage(message) {
 }
 
 function helpText() {
+  const guardNote = DANGEROUS_ENABLED
+    ? "🛡️ **Admin guard AKTIF**:\n"
+    + "perintah berbahaya (rm -rf, sudo, shutdown, dsb.) **diblokir** dan butuh\n"
+    + "persetujuan admin via tombol **▶ Lanjutkan**.\n"
+    : "Admin guard sedang **mati** — jalankan `safe!on` oleh admin untuk\n"
+    + "mengaktifkan blokir perintah berbahaya.\n";
   return `**📟 Terminal Session Manager (mini-tmux)**
 \`\`\`
 — Session Management —
 buat! <nama>     Buat session baru & jadikan active
 pindah! <nama>   Pindah ke session yang sudah ada
 hapus!           Hentikan & hapus session aktif
+
+— Admin Guard (hanya admin) —
+safe! on|off     Nyala/mati blokir perintah berbahaya
 
 — Input Terminal —
 ! <perintah>     Kirim perintah (auto newline)
@@ -543,7 +794,7 @@ c!               Kirim Ctrl+C (Interrupt)
 up! down! right! left!
 enter!  tab!  space!
 \`\`\`
-⚠️ Output terminal di-stream (edit message) otomatis & throttle ~800ms.
+${guardNote}⚠️ Output terminal di-stream (edit message) otomatis & throttle ~800ms.
 Output per-perintah dibuat di pesan Discord terpisah.
 Output ANSI warna (mis. \`ls --color\`) dirender BERWARNA di Discord
 melalui block \`\`\`ansi (escape SGR dipertahankan).
@@ -557,6 +808,7 @@ client.once("ready", () => {
 });
 
 client.on("messageCreate", onMessage);
+client.on("interactionCreate", onInteraction);
 
 // ------------------- BOOT -------------------
 const token = process.env.DISCORD_TOKEN;
