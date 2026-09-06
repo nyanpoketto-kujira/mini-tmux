@@ -63,18 +63,26 @@ function escapeBlock(text) {
 
 function cleanAnsi(str) {
   if (!str) return '';
-  // 1. Normalisasi newline
-  let text = str.replace(/\r\n|\r/g, '\n');
-  // 2. Hapus OSC title sequence (\x1b]...\x07)
+  // 1. Normalisasi CRLF -> LF.
+  let text = str.replace(/\r\n/g, '\n');
+  // 2. Reduksi lone \r (carriage return): terminal memindahkan kursor ke kolom 0,
+  //    lalu karakter setelahnya menimpa baris. Sisakan hanya bagian setelah \r
+  //    terakhir pada tiap baris (mis. "50%\r60%\r100%" -> "100%"). HARUS sebelum
+  //    langkah pembersihan kontrol (langkah 6) yang ikut menghapus \r.
+  text = text.split('\n').map((line) => {
+    const idx = line.lastIndexOf('\r');
+    return idx === -1 ? line : line.slice(idx + 1);
+  }).join('\n');
+  // 3. Hapus OSC title sequence (\x1b]...\x07)
   text = text.replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '');
-  // 3. Hapus non-SGR (cursor move, clear screen \x1b[2K, dll)
+  // 4. Hapus non-SGR (cursor move, clear screen \x1b[2K, dll)
   //    Catatan: 'm' (SGR final byte) TIDAK boleh ada di range ini.
   text = text.replace(/\x1b\[[0-9;?]*[A-HJKSTf-lp-su]/g, '');
-  // 4. Hapus 256-color & truecolor (\x1b[38;...m) yang tidak didukung Discord
+  // 5. Hapus 256-color & truecolor (\x1b[38;...m) yang tidak didukung Discord
   text = text.replace(/\x1b\[(?:38|48);[0-9;]+m/g, '');
-  // 5. Normalisasi \x1b[m jadi \x1b[0m
+  // 6. Normalisasi \x1b[m jadi \x1b[0m
   text = text.replace(/\x1b\[m/g, '\x1b[0m');
-  // 6. Buang kontrol karakter HANYA selain \t, \n, dan \x1b (JANGAN HAPUS \x1b!)
+  // 7. Buang kontrol karakter HANYA selain \t, \n, dan \x1b (JANGAN HAPUS \x1b!)
   text = text.replace(/[\x00-\x08\x0B-\x1A\x1C-\x1F\x7F]/g, '');
   return text;
 }
@@ -85,69 +93,170 @@ function renderBlock(chunk) {
   return "```ansi\n" + escapeBlock(chunk) + "\x1b[0m\n```";
 }
 
+// Render satu "halaman" (pesan Discord) stream: dalam model append+scroll,
+// satu halaman = satu blok kode.
+function renderPage(page) {
+  return renderBlock(page);
+}
+
 // Potong teks ke `max`, tanpa memotong di tengah urutan escape SGR (\x1b[...m)
+// atau di tengah \x1b polos. Jika sepotong escape menempati seluruh budget,
+// kembalikan part kosong (tidak memaksakan escape yang terpotong ke output).
 function splitChunk(text, max) {
   if (text.length <= max) return [text, ""];
   let part = text.slice(0, max);
-  const partial = part.match(/\x1b\[[0-9;]*$/);
-  if (partial && !partial[0].endsWith("m")) {
-    // mundur ke sebelum escape yang terpotong
-    part = part.slice(0, part.length - partial[0].length);
-    if (part.length === 0) part = text.slice(0, max);
+  const tr = part.match(/\x1b(\[[0-9;?]*)?$/);
+  if (tr && !tr[0].endsWith("m")) {
+    // mundur ke sebelum escape yang terpotong / \x1b polos
+    part = part.slice(0, part.length - tr[0].length);
+    // jangan paksa part kembali penuh (fallback lama) — escape bisa tertinggal
   }
   return [part, text.slice(part.length)];
 }
 
 // ------------------- STREAMING / FLUSH -------------------
+// Sisa output yang gagal terkirim (rate-limit) / belum muat, menunggu flush
+// berikutnya agar tidak ada data yang "menguap".
+let pendingTail = "";
+
 async function flushSession(channel, name) {
   const session = sessions.get(name);
   if (!session || session.flushing) return;
   session.flushing = true;
 
   try {
-    // Proses SELURUH buffer yang tertunda pada setiap flush.
-    // message pertama memakai `session.msg` (send jika null / edit jika ada),
-    // bagian selanjutnya (output > MAX_CHARS) -> pesan continuation baru.
-    while (session.outputBuff.length > 0) {
-      const chunk = cleanAnsi(session.outputBuff.join(""));
+    while (session.outputBuff.length > 0 || pendingTail !== "") {
+      // Proses output masuk dalam bentuk MENTAH: emulasi \r membutuhkan batas
+      // antar-flush, sebelum reduksi per-baris \r pada cleanAnsi.
+      const incoming = pendingTail + session.outputBuff.join("");
       session.outputBuff.length = 0;
-      if (chunk.length === 0) continue; // hanya noise ANSI, jangan kirim apa-apa
+      pendingTail = "";
 
-      let rest = chunk;
-      let opened = false; // sudah ada pesan yang di-stream di flush ini
+      let rest = incoming;
+      // Normalisasi CRLF -> LF di awal (sama seperti cleanAnsi). Terminal
+      // mengubah \n menjadi \r\n pada output (opost/onlcr), jadi baris
+      // progress yang dicetak lalu pindah baris tiba sebagai "\r<bar>\r\n".
+      // Dengan normalisasi ini, \r penutup baris TIDAK dianggap menimpa isi
+      // barisnya sendiri.
+      rest = rest.replace(/\r\n/g, "\n");
+      // `session.currentText` selalu memuat isi yang sudah tampil di
+      // `session.msg`, jadi output tidak "menguap": kami meng-edit pesan yang
+      // sama sampai penuh (MAX_CHARS), lalu membuka pesan baru (scroll).
+      let cur = session.currentText ?? "";
+      let msg = session.msg;
+
+      // --- Emulasi \r LINTAS-FLUSH (progress bar) ---
+      // Script mengupdate baris pakai "\r<segi>" pada baris yang sama. Bila
+      // flush memotong baris itu, segmen lama sudah terlanjur tampil di pesan.
+      // Kalau output baru diawali \r dan kursor masih di baris aktif (cur tak
+      // diakhiri \n), segmen terbaru MENIMPA baris itu, bukan menempel ke samping.
+      if (rest.startsWith("\r") && cur.length > 0 && !cur.endsWith("\n")) {
+        const lastNl = cur.lastIndexOf("\n");
+        const head = lastNl === -1 ? "" : cur.slice(0, lastNl + 1);
+        const nlIdx = rest.indexOf("\n");
+        const firstSeg = nlIdx === -1 ? rest : rest.slice(0, nlIdx);
+        // Pertahankan \n berikutnya: \n = baris baru, bukan bagian yang ditimpa.
+        rest = nlIdx === -1 ? "" : rest.slice(nlIdx);
+        // Segmen setelah \r terakhir adalah tampilan baris tersebut.
+        // Jaga-jaga bila baris berakhir \r (tanpa \n menyusul di flush sama):
+        // \r itu hanya mengembalikan kursor, bukan menghapus isi baris.
+        const seg = firstSeg.split("\r");
+        let newActive = cleanAnsi(seg.pop());
+        if (newActive === "" && seg.length > 0) {
+          newActive = cleanAnsi(seg.pop());
+        }
+        const newCur = head + newActive;
+        if (newCur.length > 0 && newCur.length <= MAX_CHARS) {
+          try {
+            msg = msg
+              ? await msg.edit(renderPage(newCur))
+              : await channel.send(renderPage(newCur));
+          } catch (err) {
+            println(`[stream] Gagal kirim '${name}': ${err.message}`);
+            pendingTail = incoming;
+            return;
+          }
+          cur = newCur;
+          session.msg = msg;
+          session.currentText = cur;
+        } else if (newCur.length > 0) {
+          // Baris hasil menimpa melebihi satu halaman -> mulai pesan baru.
+          msg = null;
+          cur = "";
+          session.msg = null;
+          session.currentText = "";
+          rest = newCur + rest;
+        }
+      }
+
+      // Bersihkan ANSI sisa (reduksi \r per-baris di dalamnya ikut dikerjakan).
+      rest = cleanAnsi(rest);
 
       while (rest.length > 0) {
-        const [part, remainder] = splitChunk(rest, MAX_CHARS);
-        rest = remainder;
-        const text = renderBlock(part);
+        // Sisa ruang yang tersedia di pesan aktif.
+        const budget = MAX_CHARS - cur.length;
 
-        try {
-          if (!opened) {
-            if (session.msg) {
-              // masih dalam satu batch command -> stream (edit pesan aktif)
-              await session.msg.edit(text);
-            } else {
-              // command baru dimulai -> buat pesan Discord BARU
-              session.msg = await channel.send(text);
+        let take, remainder;
+        if (budget > 0) {
+          // Masih ada ruang -> isi pesan aktif sampai batas MAX_CHARS.
+          [take, remainder] = splitChunk(rest, budget);
+          if (take === "") {
+            // Eskap ANSI tidak muat di sisa ruang pesan aktif -> buka pesan
+            // continuation baru untuk sisa output (agar escape tak terpotong).
+            // `cur` sudah tampil penuh di pesan lama; mulai halaman baru.
+            const [take2, rem2] = splitChunk(rest, MAX_CHARS);
+            try {
+              msg = await channel.send(renderPage(take2));
+            } catch (err) {
+              println(`[stream] Gagal kirim '${name}': ${err.message}`);
+              pendingTail = rest;
+              return;
             }
-          } else {
-            // output melebihi ~1800 char: tutup blok ```ansi (sudah di-render),
-            // buka blok ```ansi baru lewat pesan continuation baru.
-            session.msg = await channel.send(text);
+            cur = take2;
+            session.msg = msg;
+            session.currentText = cur;
+            rest = rem2;
+            continue;
           }
-          opened = true;
-        } catch (err) {
-          // rate limit / error Discord: simpan sisa buffer agar tidak hilang
-          println(`[stream] Gagal kirim untuk '${name}': ${err.message}`);
-          session.outputBuff.unshift(part + rest);
-          return;
+          const newText = cur + take;
+          try {
+            if (msg) {
+              msg = await msg.edit(renderPage(newText));
+            } else {
+              msg = await channel.send(renderPage(newText));
+            }
+          } catch (err) {
+            println(`[stream] Gagal kirim '${name}': ${err.message}`);
+            // Jangan kehilangan data: kembali ke buffer, coba lagi flush berikut.
+            // `cur` sudah tampil di `msg`, jadi cukup simpan `rest` (tak terkirim).
+            pendingTail = rest;
+            return;
+          }
+          cur = newText;
+          session.msg = msg;
+          session.currentText = cur;
+          rest = remainder;
+        } else {
+          // Pesan aktif sudah penuh -> buka pesan continuation baru.
+          [take, remainder] = splitChunk(rest, MAX_CHARS);
+          try {
+            msg = await channel.send(renderPage(take));
+          } catch (err) {
+            println(`[stream] Gagal kirim '${name}': ${err.message}`);
+            pendingTail = rest;
+            return;
+          }
+          cur = take;
+          session.msg = msg;
+          session.currentText = cur;
+          rest = remainder;
         }
       }
     }
   } finally {
     session.flushing = false;
     // Output yang masih datang selama flush -> lanjutkan stream berikutnya.
-    if (session.outputBuff.length > 0) {
+    if (session.outputBuff.length > 0 || pendingTail !== "") {
       scheduleFlush(channel, name);
     }
   }
@@ -176,7 +285,8 @@ function spawnSession(channel, name) {
     outputBuff: [],
     flushTimer: null,
     flushing: false,
-    msg: null, // pesan aktif utk batch command saat ini
+    msg: null, // pesan Discord aktif (sdg di-stream/append)
+    currentText: "", // isi mentah yg sudah tampil di `msg` (anti-menguap)
     lastExit: null, // exitCode + signal terakhir sesi ini
     // Pesan Discord pemicu command terakhir. Dipakai sebagai target react
     // emoji exit code saat pty selesai menjalankan command.
@@ -346,50 +456,61 @@ async function onMessage(message) {
   if (message.author.bot) return;
   const { channel, content } = message;
 
-  if (!content.startsWith("buat!") &&
-      !content.startsWith("pindah!") &&
-      content !== "hapus!" &&
-      !content.startsWith("stdin!") &&
-      content !== "c!" &&
-      !(content in ANSI_MAP) &&
-      !content.startsWith("!") &&
-      !content.startsWith("help")) {
+  // Normalisasi: terima "buat!" / "buat! nama", juga tanpa spasi setelah "!".
+  const stripped = content.trim();
+
+  const isCommand =
+    stripped.startsWith("buat!") ||
+    stripped.startsWith("pindah!") ||
+    stripped === "hapus!" ||
+    stripped.startsWith("stdin!") ||
+    stripped === "c!" ||
+    Object.prototype.hasOwnProperty.call(ANSI_MAP, stripped) ||
+    stripped.startsWith("!") ||
+    stripped.startsWith("help");
+
+  if (!isCommand) {
     return;
   }
 
   let reply = null;
 
   try {
-    if (content.startsWith("help")) {
+    let body = stripped;
+
+    if (body.startsWith("help")) {
       reply = helpText();
-    } else if (content.startsWith("buat! ")) {
-      reply = handleCreate(channel, content.slice(6).trim());
-    } else if (content.startsWith("pindah! ")) {
-      reply = handlePindah(channel, content.slice(8).trim());
-    } else if (content === "hapus!") {
+    } else if (body.startsWith("buat!")) {
+      reply = handleCreate(channel, body.slice(5).trim());
+    } else if (body.startsWith("pindah!")) {
+      reply = handlePindah(channel, body.slice(7).trim());
+    } else if (body === "hapus!") {
       reply = await handleHapus(channel);
-    } else if (content.startsWith("stdin! ")) {
-      // Input interaktif: tetap stream ke pesan aktif terakhir
-      const data = content.slice(7);
+    } else if (body.startsWith("stdin!")) {
+      // Input interaktif: tetap stream ke pesan aktif terakhir.
+      // Hapus satu spasi pemisah bila ada, kirim sisanya verbatim.
+      const data = body.slice(6).replace(/^ /, "");
       reply = writeToActive(channel, data);
-    } else if (content === "c!") {
+    } else if (body === "c!") {
       reply = writeToActive(channel, "\x03"); // Ctrl+C
-    } else if (content in ANSI_MAP) {
+    } else if (Object.prototype.hasOwnProperty.call(ANSI_MAP, body)) {
       // Navigasi / input dasar: tetap update ke pesan aktif terakhir
-      reply = writeToActive(channel, ANSI_MAP[content]);
-    } else if (content.startsWith("! ")) {
+      reply = writeToActive(channel, ANSI_MAP[body]);
+    } else if (body.startsWith("!")) {
       // PER-COMMAND STREAMING: command baru -> pesan Discord baru.
-      // Reset pointer agar output berikutnya dibuatkan pesan sendiri,
-      // tidak lagi meng-edit pesan command sebelumnya.
+      // Terima "! cmd" maupun "!cmd", lalu append \r sebagai Enter PTY.
       const session = requireActive(channel);
       if (session) {
+        // Segmen baru: pesan output perintah ini dibuat sendiri. Output
+        // segmen sebelumnya sudah tampil di `session.msg` (bukan hilang).
         session.msg = null;
+        session.currentText = "";
         // Simpan pesan pemicu supaya bisa di-react emoji exit code ketika
         // command ini selesai dieksekusi pty.
         session.lastCmdMsg = message;
       }
 
-      const cmd = content.slice(2) + "\r";
+      const cmd = body.slice(1).trimStart() + "\r";
       reply = writeToActive(channel, cmd);
     }
 
